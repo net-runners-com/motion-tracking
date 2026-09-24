@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Skeleton Tracker</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0c110e; --panel: #18201b; --fg: #e4ebe6; --muted: #93a198;
+    --line: #2c3830; --accent: #5cc98f;
+    --left: #ff9f1a; --right: #1a8cff; --center: #50dc50;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 "Zen Kaku Gothic New", system-ui, -apple-system, sans-serif;
+         display: flex; flex-direction: column;
+         padding: env(safe-area-inset-top, 0px) 16px env(safe-area-inset-bottom, 0px); }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-block: 10px; }
+  h1 { font-size: 16px; margin: 0 8px 0 0; }
+  button, select { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--accent); }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0c110e; font-weight: 700; }
+  #status { margin-left: auto; color: var(--muted);
+            font: 500 13px "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  #stage { position: relative; flex: 1; min-height: 0; display: grid; place-items: center;
+           border-radius: 8px; overflow: hidden; background: #000; margin-bottom: 12px; }
+  #frame { position: relative; max-width: 100%; max-height: 100%; }
+  #frame video, #frame canvas { display: block; max-width: 100%; max-height: calc(100vh - 140px); }
+  #frame canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #empty { text-align: center; padding: 32px 16px; display: grid; gap: 12px; justify-items: center; }
+  #empty p { margin: 0; color: var(--muted); }
+  .mirror { transform: scaleX(-1); }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; color: var(--muted); font-size: 13px; padding-bottom: 12px; }
+  .legend span::before { content: ""; display: inline-block; width: 18px; height: 3px;
+         border-radius: 2px; margin-right: 6px; vertical-align: middle; background: var(--c); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Skeleton Tracker</h1>
+  <button id="flipBtn" type="button" hidden>カメラ切替</button>
+  <select id="modelSel" aria-label="モデル">
+    <option value="lite">lite（速い）</option>
+    <option value="full" selected>full</option>
+    <option value="heavy">heavy（高精度）</option>
+  </select>
+  <select id="posesSel" aria-label="最大人数">
+    <option value="1">1人</option><option value="2" selected>2人</option><option value="4">4人</option>
+  </select>
+  <label><input id="bgChk" type="checkbox"> 映像を隠す</label>
+  <span id="status">モデル読込中…</span>
+</header>
+<div id="stage">
+  <div id="empty">
+    <button id="camBtn" class="primary" type="button">カメラを起動</button>
+    <p>カメラ映像から骨格（33点）を検出し、線でリアルタイム描画します</p>
+  </div>
+  <div id="frame" hidden>
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+</div>
+<div class="legend">
+  <span style="--c: var(--left)">左半身</span>
+  <span style="--c: var(--right)">右半身</span>
+  <span style="--c: var(--center)">体幹・顔</span>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = (v) =>
+  `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${v}/float16/1/pose_landmarker_${v}.task`;
+
+// MediaPipe 33-point indices. L = left side, R = right side, C = center.
+const L = "#ff9f1a", R = "#1a8cff", C = "#50dc50";
+const BONES = [
+  [11, 13, L], [13, 15, L], [15, 17, L], [15, 19, L], [15, 21, L], [17, 19, L],   // left arm/hand
+  [12, 14, R], [14, 16, R], [16, 18, R], [16, 20, R], [16, 22, R], [18, 20, R],   // right arm/hand
+  [23, 25, L], [25, 27, L], [27, 29, L], [29, 31, L], [27, 31, L],                // left leg/foot
+  [24, 26, R], [26, 28, R], [28, 30, R], [30, 32, R], [28, 32, R],                // right leg/foot
+  [11, 12, C], [23, 24, C], [11, 23, L], [12, 24, R],                             // torso
+  [0, 2, C], [0, 5, C], [2, 7, C], [5, 8, C], [9, 10, C],                         // face
+];
+const VIS_THR = 0.5;
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const status = $("status");
+
+let vision, landmarker = null, running = false, lastVideoTime = -1, fps = 0, lastT = 0;
+let facing = "user";
+
+async function loadModel() {
+  status.textContent = "モデル読込中…";
+  vision ??= await FilesetResolver.forVisionTasks(WASM);
+  const old = landmarker;
+  landmarker = null;  // stop the loop from using it while we swap
+  old?.close();
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL($("modelSel").value), delegate },
+    runningMode: "VIDEO",
+    numPoses: Number($("posesSel").value),
+  });
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU"));
+  } catch {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU"));
+  }
+  status.textContent = running ? "" : "準備完了";
+}
+
+function draw(result) {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if ($("bgChk").checked) { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h); }
+  const lw = Math.max(2, w / 250), r = lw * 1.2;
+  ctx.lineWidth = lw;
+  ctx.lineCap = "round";
+  for (const lm of result.landmarks) {
+    const ok = (i) => (lm[i].visibility ?? 1) >= VIS_THR;
+    for (const [a, b, color] of BONES) {
+      if (!ok(a) || !ok(b)) continue;
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(lm[a].x * w, lm[a].y * h);
+      ctx.lineTo(lm[b].x * w, lm[b].y * h);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#fff";
+    lm.forEach((p, i) => {
+      if (!ok(i)) return;
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
+function loop() {
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+    const now = performance.now();
+    draw(landmarker.detectForVideo(video, now));
+    if (lastT) fps = fps ? fps * 0.9 + 100 / (now - lastT) : 1000 / (now - lastT);
+    lastT = now;
+    status.textContent = `${fps.toFixed(1)} FPS`;
+  }
+  requestAnimationFrame(loop);
+}
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 },
+               frameRate: { ideal: 60 } },
+      audio: false,
+    });
+    video.srcObject?.getTracks().forEach((t) => t.stop());
+    video.srcObject = stream;
+    await video.play();
+    const mirror = facing === "user";
+    video.classList.toggle("mirror", mirror);
+    canvas.classList.toggle("mirror", mirror);
+    $("empty").hidden = true;
+    $("frame").hidden = false;
+    lastVideoTime = -1; lastT = 0; fps = 0;
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+    $("flipBtn").hidden = cams.length < 2;
+    if (!running) { running = true; requestAnimationFrame(loop); }
+  } catch (e) {
+    status.textContent = e.name === "NotAllowedError"
+      ? "カメラが許可されていません。ブラウザの設定で許可してください"
+      : `カメラを起動できません: ${e.message}`;
+  }
+}
+
+$("camBtn").onclick = startCamera;
+$("flipBtn").onclick = () => { facing = facing === "user" ? "environment" : "user"; startCamera(); };
+
+// Changing model / pose count needs a new landmarker instance.
+$("modelSel").onchange = $("posesSel").onchange = () => { lastT = 0; loadModel(); };
+
+loadModel().catch((e) => { status.textContent = `モデル読込失敗: ${e.message}`; });
+</script>
+</body>
+</html>
