@@ -181,8 +181,9 @@ async function startCamera() {
     $("flipBtn").hidden = cams.length < 2;
     if (!running) { running = true; requestAnimationFrame(loop); }
   } catch (e) {
-    status.textContent = e.name === "NotAllowedError"
-      ? "カメラが許可されていません。ブラウザの設定で許可してください"
+    status.textContent =
+      e.name === "NotAllowedError" ? "カメラが許可されていません。ブラウザの設定で許可してください"
+      : e.name === "NotReadableError" ? "カメラを他のアプリ（ビデオ通話など）が使用中です"
       : `カメラを起動できません: ${e.message}`;
   }
 }
