@@ -107,6 +107,9 @@ async function initRuntime() {
   // JSPI lets LiteRT run unsupported ops on CPU while the rest stays on WebGPU.
   const jspi = await supportsFeature("jspi").catch(() => false);
   await loadLiteRt(WASM_DIR, { jspi });
+  // Without JSPI (e.g. Safari) MoveNet can't be split across GPU/CPU and runs fully on CPU,
+  // where Thunder is ~4x slower than Lightning. Start with Lightning there.
+  if (!jspi) $("modelSel").value = "lightning";
 }
 
 async function compileModel(name) {
@@ -272,7 +275,7 @@ function loop() {
         const now = performance.now();
         if (lastT) fps = fps ? fps * 0.9 + 100 / (now - lastT) : 1000 / (now - lastT);
         lastT = now;
-        status.textContent = `${fps.toFixed(1)} FPS · ${accel}`;
+        status.textContent = `${fps.toFixed(1)} FPS（カメラ ${Math.round(camFps)}fps）· ${accel}`;
       })
       .catch((e) => { console.error(e); status.textContent = `推論エラー: ${e.message}`; })
       .finally(() => { busy = false; });
@@ -281,15 +284,29 @@ function loop() {
 }
 
 // ---------- camera ----------
-let facing = "user", running = false;
+let facing = "user", running = false, camFps = 0;
+
+// Ask for 60fps first. Many cameras only reach 60fps at 720p or lower, so step down the
+// resolution before settling for whatever frame rate the camera offers.
+async function openCamera() {
+  const tries = [
+    { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { min: 50, ideal: 60 } },
+    { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { min: 50, ideal: 60 } },
+    { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+  ];
+  for (const [i, v] of tries.entries()) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, ...v }, audio: false });
+    } catch (e) {
+      if (e.name !== "OverconstrainedError" || i === tries.length - 1) throw e;
+    }
+  }
+}
 
 async function startCamera() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 },
-               frameRate: { ideal: 60 } },
-      audio: false,
-    });
+    const stream = await openCamera();
+    camFps = stream.getVideoTracks()[0].getSettings().frameRate || 0;
     video.srcObject?.getTracks().forEach((t) => t.stop());
     video.srcObject = stream;
     await video.play();
