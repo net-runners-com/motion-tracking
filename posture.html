@@ -343,7 +343,8 @@ async function analyzeImage(section, img) {
   }
   const p = r.landmarks[0].map((q) => ({ x: q.x * w, y: q.y * h, visibility: q.visibility }));
   // Every measurement needs head-to-heel in the frame; refuse half-body shots instead of guessing.
-  const inFrame = [NOSE, ...HEEL].every((i) => p[i].y > 0 && p[i].y < h);
+  const inFrame = [NOSE, ...HEEL].every((i) =>
+    p[i].x > 0 && p[i].x < w && p[i].y > 0 && p[i].y < h && (p[i].visibility ?? 1) > 0.5);
   if (!inFrame) {
     view.replaceChildren(cv);
     table.innerHTML = `<tr><td>頭から足先までが写っていません。全身が入るように撮り直してください。</td></tr>`;
