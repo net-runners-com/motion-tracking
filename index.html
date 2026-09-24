@@ -20,10 +20,10 @@
          padding: env(safe-area-inset-top, 0px) 16px env(safe-area-inset-bottom, 0px); }
   header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-block: 10px; }
   h1 { font-size: 16px; margin: 0 8px 0 0; }
-  button { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
-           border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
-  button:hover { border-color: var(--accent); }
-  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button, select { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--accent); }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #0c110e; font-weight: 700; }
   button:disabled { opacity: .5; cursor: default; }
   #status { margin-left: auto; color: var(--muted);
@@ -46,6 +46,10 @@
 <header>
   <h1>Skeleton Tracker</h1>
   <button id="flipBtn" type="button" hidden>カメラ切替</button>
+  <select id="modelSel" aria-label="モデル">
+    <option value="thunder" selected>Thunder（高精度）</option>
+    <option value="lightning">Lightning（高速）</option>
+  </select>
   <label>スムージング <input id="smoothRange" type="range" min="0" max="100" value="50"></label>
   <label><input id="bgChk" type="checkbox"> 映像を隠す</label>
   <span id="status">モデル読込中…</span>
@@ -53,8 +57,7 @@
 <div id="stage">
   <div id="empty">
     <button id="camBtn" class="primary" type="button" disabled>カメラを起動</button>
-    <p>一番近くにいる 1 人の骨格（17 点）を RTMPose で検出し、線でリアルタイム描画します<br>
-       初回はモデル（約 75MB）のダウンロードに時間がかかります</p>
+    <p>1 人の骨格（17 点）を MoveNet + LiteRT.js で検出し、線でリアルタイム描画します</p>
   </div>
   <div id="frame" hidden>
     <video id="video" playsinline muted></video>
@@ -68,17 +71,17 @@
 </div>
 
 <script type="module">
-import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.mjs";
-ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+import { loadLiteRt, loadAndCompile, Tensor, isWebGPUSupported, supportsFeature } from
+  "https://cdn.jsdelivr.net/npm/@litertjs/core@2.5.3/+esm";
 
-// Person detector (YOLOX-tiny, HumanArt) + top-down pose (RTMPose-m, Body7, 256x192).
-const DET_URL = "models/yolox-tiny-humanart.onnx";
-const POSE_URL = "models/rtmpose-m-body7.onnx";
-const DET_SIZE = 416, DET_THR = 0.4;
-const POSE_W = 192, POSE_H = 256, SIMCC_SPLIT = 2;
-const MEAN = [123.675, 116.28, 103.53], STD = [58.395, 57.12, 57.375];
-const REDETECT_EVERY = 30;   // frames; re-pick the closest person periodically
-const LOST_THR = 0.3;        // mean keypoint score below this = person lost
+const WASM_DIR = "https://cdn.jsdelivr.net/npm/@litertjs/core@2.5.3/wasm/";
+// MoveNet SinglePose (float16). Input uint8 [1,S,S,3] RGB; output [1,1,17,3] = (y, x, score) in the crop.
+const MODELS = {
+  thunder: { url: "models/movenet_thunder.tflite", size: 256 },
+  lightning: { url: "models/movenet_lightning.tflite", size: 192 },
+};
+const MIN_CROP_SCORE = 0.2;  // keypoints below this don't steer the crop
+const LOST_THR = 0.2;        // mean score below this = person lost, search the whole frame
 
 // COCO 17 keypoints. L = left side, R = right side, C = center.
 const L = "#ff9f1a", R = "#1a8cff", C = "#50dc50";
@@ -89,154 +92,93 @@ const BONES = [
   [0, 1, C], [0, 2, C], [1, 3, C], [2, 4, C],           // face
 ];
 // Visibility hysteresis so points near the threshold don't blink.
-const SHOW_THR = 0.4, HIDE_THR = 0.25;
+const SHOW_THR = 0.3, HIDE_THR = 0.2;
 
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
 const status = $("status");
 
-const detCv = new OffscreenCanvas(DET_SIZE, DET_SIZE);
-const detCtx = detCv.getContext("2d", { willReadFrequently: true });
-const poseCv = new OffscreenCanvas(POSE_W, POSE_H);
-const poseCtx = poseCv.getContext("2d", { willReadFrequently: true });
-
-let detSess, poseSess, backend = "";
+let model = null, inputSize = 256, accel = "", pre = null, preCtx = null;
+const compiled = {};
 
 // ---------- model loading ----------
-async function fetchModel(url, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  const total = Number(res.headers.get("content-length")) || 0;
-  const reader = res.body.getReader();
-  const chunks = [];
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    onProgress(got, total);
-  }
-  const buf = new Uint8Array(got);
-  let off = 0;
-  for (const c of chunks) { buf.set(c, off); off += c.length; }
-  return buf;
+async function initRuntime() {
+  status.textContent = "ランタイム読込中…";
+  // JSPI lets LiteRT run unsupported ops on CPU while the rest stays on WebGPU.
+  const jspi = await supportsFeature("jspi").catch(() => false);
+  await loadLiteRt(WASM_DIR, { jspi });
 }
 
-async function createSession(buf) {
-  if ("gpu" in navigator) {
+async function compileModel(name) {
+  if (compiled[name]) return compiled[name];
+  status.textContent = "モデル読込中…";
+  const { url } = MODELS[name];
+  if (isWebGPUSupported()) {
     try {
-      const s = await ort.InferenceSession.create(buf, { executionProviders: ["webgpu", "wasm"] });
-      backend = "webgpu";
-      return s;
-    } catch (e) { console.warn("webgpu failed, falling back to wasm", e); }
+      compiled[name] = { m: await loadAndCompile(url, { accelerator: "webgpu" }), accel: "webgpu" };
+      return compiled[name];
+    } catch (e) { console.warn("WebGPU compile failed, using wasm", e); }
   }
-  backend = "wasm";
-  return ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
+  compiled[name] = { m: await loadAndCompile(url, { accelerator: "wasm" }), accel: "wasm" };
+  return compiled[name];
 }
 
-async function loadModels() {
-  const sizes = { det: [0, 0], pose: [0, 0] };
-  const show = () => {
-    const got = sizes.det[0] + sizes.pose[0], tot = sizes.det[1] + sizes.pose[1];
-    status.textContent = tot ? `モデル読込中 ${Math.floor(100 * got / tot)}%` : "モデル読込中…";
-  };
-  const [detBuf, poseBuf] = await Promise.all([
-    fetchModel(DET_URL, (g, t) => { sizes.det = [g, t]; show(); }),
-    fetchModel(POSE_URL, (g, t) => { sizes.pose = [g, t]; show(); }),
-  ]);
-  status.textContent = "モデル初期化中…";
-  detSess = await createSession(detBuf);
-  poseSess = await createSession(poseBuf);
-  status.textContent = `準備完了 (${backend})`;
-  $("camBtn").disabled = false;
+async function selectModel(name) {
+  model = null;  // pause inference while switching
+  const c = await compileModel(name);
+  inputSize = MODELS[name].size;
+  pre = new OffscreenCanvas(inputSize, inputSize);
+  preCtx = pre.getContext("2d", { willReadFrequently: true });
+  accel = c.accel;
+  crop = null;
+  model = c.m;
+  status.textContent = running ? "" : `準備完了 (${accel})`;
 }
 
 // ---------- inference ----------
-// Returns person boxes [x1, y1, x2, y2, score] in video pixels.
-async function detect() {
+let crop = null;  // square region of the video fed to the model: {cx, cy, size} in px
+
+function fullCrop() {
   const W = video.videoWidth, H = video.videoHeight;
-  const r = Math.min(DET_SIZE / W, DET_SIZE / H);
-  detCtx.fillStyle = "rgb(114,114,114)";
-  detCtx.fillRect(0, 0, DET_SIZE, DET_SIZE);
-  detCtx.drawImage(video, 0, 0, Math.round(W * r), Math.round(H * r));
-  const px = detCtx.getImageData(0, 0, DET_SIZE, DET_SIZE).data;
-  const n = DET_SIZE * DET_SIZE, input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {        // BGR, 0-255, CHW
-    input[i] = px[4 * i + 2];
-    input[n + i] = px[4 * i + 1];
-    input[2 * n + i] = px[4 * i];
-  }
-  const out = await detSess.run({ input: new ort.Tensor("float32", input, [1, 3, DET_SIZE, DET_SIZE]) });
-  const dets = out.dets.data, labels = out.labels.data, boxes = [];
-  for (let i = 0; i < labels.length; i++) {
-    const s = dets[5 * i + 4];
-    if (Number(labels[i]) !== 0 || s < DET_THR) continue;
-    boxes.push([dets[5 * i] / r, dets[5 * i + 1] / r, dets[5 * i + 2] / r, dets[5 * i + 3] / r, s]);
-  }
-  return boxes;
+  return { cx: W / 2, cy: H / 2, size: Math.max(W, H) };
 }
 
-// Returns 17 keypoints {x, y, s} in video pixels for the given box.
-async function estimate(box) {
-  const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
-  let w = (box[2] - box[0]) * 1.25, h = (box[3] - box[1]) * 1.25;
-  if (w / h > POSE_W / POSE_H) h = w * POSE_H / POSE_W; else w = h * POSE_W / POSE_H;
-  const sx = cx - w / 2, sy = cy - h / 2;
-  poseCtx.fillStyle = "#000";
-  poseCtx.fillRect(0, 0, POSE_W, POSE_H);
-  poseCtx.drawImage(video, sx, sy, w, h, 0, 0, POSE_W, POSE_H);
-  const px = poseCtx.getImageData(0, 0, POSE_W, POSE_H).data;
-  const n = POSE_W * POSE_H, input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {        // RGB, normalized, CHW
-    input[i] = (px[4 * i] - MEAN[0]) / STD[0];
-    input[n + i] = (px[4 * i + 1] - MEAN[1]) / STD[1];
-    input[2 * n + i] = (px[4 * i + 2] - MEAN[2]) / STD[2];
+async function estimate(c) {
+  const S = inputSize, x0 = c.cx - c.size / 2, y0 = c.cy - c.size / 2;
+  preCtx.fillStyle = "#000";
+  preCtx.fillRect(0, 0, S, S);
+  preCtx.drawImage(video, x0, y0, c.size, c.size, 0, 0, S, S);
+  const px = preCtx.getImageData(0, 0, S, S).data;
+  const rgb = new Uint8Array(S * S * 3);
+  for (let i = 0, j = 0; i < px.length; i += 4, j += 3) {
+    rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2];
   }
-  const out = await poseSess.run({ input: new ort.Tensor("float32", input, [1, 3, POSE_H, POSE_W]) });
-  const X = out.simcc_x.data, Y = out.simcc_y.data;
-  const nx = POSE_W * SIMCC_SPLIT, ny = POSE_H * SIMCC_SPLIT, kps = [];
+  const input = new Tensor(rgb, [1, S, S, 3]);
+  let outs;
+  try { outs = await model.run(input); } finally { input.delete(); }
+  const out = await outs[0].data();
+  outs.forEach((t) => t.delete());
+  const kps = [];
   for (let k = 0; k < 17; k++) {
-    let bx = 0, vx = -Infinity, by = 0, vy = -Infinity;
-    for (let j = 0; j < nx; j++) { const v = X[k * nx + j]; if (v > vx) { vx = v; bx = j; } }
-    for (let j = 0; j < ny; j++) { const v = Y[k * ny + j]; if (v > vy) { vy = v; by = j; } }
-    kps.push({
-      x: sx + (bx / SIMCC_SPLIT) / POSE_W * w,
-      y: sy + (by / SIMCC_SPLIT) / POSE_H * h,
-      s: Math.min(vx, vy),
-    });
+    kps.push({ x: x0 + out[3 * k + 1] * c.size, y: y0 + out[3 * k] * c.size, s: out[3 * k + 2] });
   }
   return kps;
 }
 
-// ---------- tracking (single person, closest = largest box) ----------
-const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
-function iou(a, b) {
-  const w = Math.min(a[2], b[2]) - Math.max(a[0], b[0]);
-  const h = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
-  if (w <= 0 || h <= 0) return 0;
-  const i = w * h;
-  return i / (area(a) + area(b) - i);
-}
-
-// Pick the largest person; keep the current one unless someone is clearly closer.
-function choose(boxes, current) {
-  if (!boxes.length) return null;
-  const largest = boxes.reduce((a, b) => (area(b) > area(a) ? b : a));
-  if (!current) return largest;
-  const same = boxes.reduce((a, b) => (iou(b, current) > iou(a, current) ? b : a));
-  if (iou(same, current) < 0.3) return largest;
-  return area(largest) > area(same) * 1.2 ? largest : same;
-}
-
-function boxFromKeypoints(kps) {
-  const ok = kps.filter((k) => k.s >= LOST_THR);
-  if (ok.length < 4) return null;
-  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
-  for (const k of ok) { x1 = Math.min(x1, k.x); y1 = Math.min(y1, k.y); x2 = Math.max(x2, k.x); y2 = Math.max(y2, k.y); }
-  // Keypoints don't reach the top of the head or the soles; widen a little.
-  const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, w = (x2 - x1) * 1.1, h = (y2 - y1) * 1.15;
-  return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+// Next frame's crop from this frame's keypoints (the MoveNet "smart cropping" recipe):
+// center on the hips, size from torso and body extent; fall back to the full frame.
+function nextCrop(k) {
+  const vis = (i) => k[i].s > MIN_CROP_SCORE;
+  if (!((vis(11) || vis(12)) && (vis(5) || vis(6)))) return fullCrop();
+  const W = video.videoWidth, H = video.videoHeight;
+  const cx = (k[11].x + k[12].x) / 2, cy = (k[11].y + k[12].y) / 2;
+  let torso = 0, body = 0;
+  for (const i of [5, 6, 11, 12]) torso = Math.max(torso, Math.abs(k[i].x - cx), Math.abs(k[i].y - cy));
+  k.forEach((p, i) => { if (vis(i)) body = Math.max(body, Math.abs(p.x - cx), Math.abs(p.y - cy)); });
+  let half = Math.max(torso * 1.9, body * 1.2);
+  half = Math.min(half, Math.max(cx, W - cx, cy, H - cy));
+  if (half * 2 > Math.max(W, H)) return fullCrop();
+  return { cx, cy, size: half * 2 };
 }
 
 // ---------- smoothing ----------
@@ -305,25 +247,20 @@ function draw(pts) {
 }
 
 // ---------- main loop ----------
-let box = null, frameNo = 0, busy = false, lastVideoTime = -1, fps = 0, lastT = 0;
+let busy = false, lastVideoTime = -1, fps = 0, lastT = 0;
 
 async function step() {
   const t = performance.now();
-  if (!box || frameNo % REDETECT_EVERY === 0) {
-    const next = choose(await detect(), box);
-    if (!next) { box = null; draw(null); return; }
-    if (!box || iou(next, box) < 0.3) resetSmoothing();  // a different person
-    box = next;
-  }
-  const kps = await estimate(box);
+  if (!crop) { crop = fullCrop(); resetSmoothing(); }
+  const kps = await estimate(crop);
   const mean = kps.reduce((s, k) => s + k.s, 0) / kps.length;
-  if (mean < LOST_THR) { box = null; draw(null); return; }
-  box = boxFromKeypoints(kps);
+  if (mean < LOST_THR) { crop = null; draw(null); return; }
+  crop = nextCrop(kps);
   draw(smooth(kps, t));
 }
 
 function loop() {
-  if (!busy && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+  if (model && !busy && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
       canvas.width = video.videoWidth;
@@ -335,10 +272,10 @@ function loop() {
         const now = performance.now();
         if (lastT) fps = fps ? fps * 0.9 + 100 / (now - lastT) : 1000 / (now - lastT);
         lastT = now;
-        status.textContent = `${fps.toFixed(1)} FPS · ${backend}`;
+        status.textContent = `${fps.toFixed(1)} FPS · ${accel}`;
       })
       .catch((e) => { console.error(e); status.textContent = `推論エラー: ${e.message}`; })
-      .finally(() => { busy = false; frameNo++; });
+      .finally(() => { busy = false; });
   }
   requestAnimationFrame(loop);
 }
@@ -361,8 +298,7 @@ async function startCamera() {
     canvas.classList.toggle("mirror", mirror);
     $("empty").hidden = true;
     $("frame").hidden = false;
-    box = null; lastVideoTime = -1; lastT = 0; fps = 0;
-    resetSmoothing();
+    crop = null; lastVideoTime = -1; lastT = 0; fps = 0;
     const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
     $("flipBtn").hidden = cams.length < 2;
     if (!running) { running = true; requestAnimationFrame(loop); }
@@ -376,8 +312,15 @@ async function startCamera() {
 
 $("camBtn").onclick = startCamera;
 $("flipBtn").onclick = () => { facing = facing === "user" ? "environment" : "user"; startCamera(); };
+$("modelSel").onchange = () => {
+  lastT = 0;
+  selectModel($("modelSel").value).catch((e) => { status.textContent = `モデル読込失敗: ${e.message}`; });
+};
 
-loadModels().catch((e) => { console.error(e); status.textContent = `モデル読込失敗: ${e.message}`; });
+initRuntime()
+  .then(() => selectModel($("modelSel").value))
+  .then(() => { $("camBtn").disabled = false; })
+  .catch((e) => { console.error(e); status.textContent = `読込失敗: ${e.message}`; });
 </script>
 </body>
 </html>
