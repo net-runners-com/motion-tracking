@@ -53,6 +53,7 @@
   <select id="posesSel" aria-label="最大人数">
     <option value="1">1人</option><option value="2" selected>2人</option><option value="4">4人</option>
   </select>
+  <label>スムージング <input id="smoothRange" type="range" min="0" max="100" value="50"></label>
   <label><input id="bgChk" type="checkbox"> 映像を隠す</label>
   <span id="status">モデル読込中…</span>
 </header>
@@ -90,7 +91,73 @@ const BONES = [
   [11, 12, C], [23, 24, C], [11, 23, L], [12, 24, R],                             // torso
   [0, 2, C], [0, 5, C], [2, 7, C], [5, 8, C], [9, 10, C],                         // face
 ];
-const VIS_THR = 0.5;
+// Visibility hysteresis: a point appears above SHOW_THR and disappears below HIDE_THR,
+// so points hovering around one threshold don't blink.
+const SHOW_THR = 0.6, HIDE_THR = 0.35;
+
+// One Euro filter (Casiez et al. 2012): heavy smoothing when still, low lag when moving fast.
+class OneEuro {
+  constructor() { this.x = null; this.dx = 0; this.t = 0; }
+  static alpha(cutoff, dt) { const r = 2 * Math.PI * cutoff * dt; return r / (r + 1); }
+  filter(x, t, minCutoff, beta) {
+    if (this.x === null) { this.x = x; this.t = t; return x; }
+    const dt = Math.max((t - this.t) / 1000, 1e-3);
+    this.t = t;
+    const dx = (x - this.x) / dt;
+    this.dx += OneEuro.alpha(1.0, dt) * (dx - this.dx);
+    const cutoff = minCutoff + beta * Math.abs(this.dx);
+    this.x += OneEuro.alpha(cutoff, dt) * (x - this.x);
+    return this.x;
+  }
+}
+
+// Per-person state. MediaPipe doesn't keep person order stable, so match by torso center.
+let tracks = [];
+const TRACK_MAX_DIST = 0.2, TRACK_TTL_MS = 500;
+
+function torsoCenter(lm) {
+  const ids = [11, 12, 23, 24];
+  return { x: ids.reduce((s, i) => s + lm[i].x, 0) / 4, y: ids.reduce((s, i) => s + lm[i].y, 0) / 4 };
+}
+
+function newTrack() {
+  return {
+    f: Array.from({ length: 33 }, () => [new OneEuro(), new OneEuro()]),
+    shown: new Array(33).fill(false),
+    pts: null, c: null, seen: 0,
+  };
+}
+
+function smooth(landmarks, t) {
+  // Smoothing slider 0..100 → minCutoff 4Hz (light) .. 0.2Hz (heavy).
+  const s = Number($("smoothRange").value) / 100;
+  const minCutoff = 4 * Math.pow(0.05, s), beta = 5;
+  const free = new Set(tracks);
+  const out = [];
+  for (const lm of landmarks) {
+    const c = torsoCenter(lm);
+    let best = null, bestD = TRACK_MAX_DIST;
+    for (const tr of free) {
+      const d = Math.hypot(tr.c.x - c.x, tr.c.y - c.y);
+      if (d < bestD) { bestD = d; best = tr; }
+    }
+    if (best) free.delete(best); else tracks.push(best = newTrack());
+    best.c = c;
+    best.seen = t;
+    best.pts = lm.map((p, i) => {
+      const v = p.visibility ?? 1;
+      best.shown[i] = best.shown[i] ? v >= HIDE_THR : v >= SHOW_THR;
+      return {
+        x: best.f[i][0].filter(p.x, t, minCutoff, beta),
+        y: best.f[i][1].filter(p.y, t, minCutoff, beta),
+        ok: best.shown[i],
+      };
+    });
+    out.push(best.pts);
+  }
+  tracks = tracks.filter((tr) => t - tr.seen < TRACK_TTL_MS);
+  return out;
+}
 
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
@@ -118,15 +185,15 @@ async function loadModel() {
   status.textContent = running ? "" : "準備完了";
 }
 
-function draw(result) {
+function draw(people) {
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
   if ($("bgChk").checked) { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h); }
   const lw = Math.max(2, w / 250), r = lw * 1.2;
   ctx.lineWidth = lw;
   ctx.lineCap = "round";
-  for (const lm of result.landmarks) {
-    const ok = (i) => (lm[i].visibility ?? 1) >= VIS_THR;
+  for (const lm of people) {
+    const ok = (i) => lm[i].ok;
     for (const [a, b, color] of BONES) {
       if (!ok(a) || !ok(b)) continue;
       ctx.strokeStyle = color;
@@ -153,7 +220,7 @@ function loop() {
       canvas.height = video.videoHeight;
     }
     const now = performance.now();
-    draw(landmarker.detectForVideo(video, now));
+    draw(smooth(landmarker.detectForVideo(video, now).landmarks, now));
     if (lastT) fps = fps ? fps * 0.9 + 100 / (now - lastT) : 1000 / (now - lastT);
     lastT = now;
     status.textContent = `${fps.toFixed(1)} FPS`;
