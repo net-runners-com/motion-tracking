@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Posture Check</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0c110e; --panel: #151c18; --panel2: #1c2520; --fg: #e4ebe6; --muted: #93a198;
+    --line: #2c3830; --accent: #5cc98f;
+    --good: #5cc98f; --warn: #f2b84b; --bad: #ef6a5b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.6 "Zen Kaku Gothic New", system-ui, -apple-system, sans-serif;
+         padding: env(safe-area-inset-top, 0px) 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
+  main { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; padding-top: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 0; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); }
+  .mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  button, label.btn { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer; display: inline-block; }
+  button:hover, label.btn:hover { border-color: var(--accent); }
+  button:focus-visible, label.btn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0c110e; font-weight: 700; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=file] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .shot { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+          display: grid; gap: 10px; align-content: start; }
+  .shot .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .shot .bar h2 { margin-right: auto; }
+  .view { position: relative; background: #000; border-radius: 8px; overflow: hidden;
+          aspect-ratio: 3 / 4; display: grid; place-items: center; max-width: 100%; }
+  .view canvas, .view video { max-width: 100%; max-height: 100%; display: block; }
+  .view .hint { color: var(--muted); padding: 16px; text-align: center; }
+  .view .count { position: absolute; inset: 0; display: grid; place-items: center;
+                 font: 700 96px "JetBrains Mono", monospace; color: #fff; text-shadow: 0 2px 12px #000; }
+  .mirror { transform: scaleX(-1); }
+  .summary { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+             display: flex; flex-wrap: wrap; gap: 16px 32px; align-items: center; }
+  .score { font: 700 56px/1 "JetBrains Mono", monospace; }
+  .score small { font-size: 16px; color: var(--muted); }
+  .pattern { display: grid; gap: 4px; flex: 1; min-width: 240px; }
+  .pattern strong { font-size: 17px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: top; }
+  td.val { text-align: right; white-space: nowrap; }
+  .chip { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; font-weight: 700;
+          color: #0c110e; white-space: nowrap; }
+  .chip.good { background: var(--good); } .chip.warn { background: var(--warn); } .chip.bad { background: var(--bad); }
+  .note { font-size: 12px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Posture Check</h1>
+    <span class="muted">正面と右側面の 2 枚で姿勢のゆがみを測ります</span>
+    <a href="./" style="margin-left:auto">リアルタイム骨格 →</a>
+    <span id="status" class="muted mono">モデル読込中…</span>
+  </header>
+
+  <div class="shots">
+    <section class="shot" data-kind="front">
+      <div class="bar">
+        <h2>① 正面</h2>
+        <button type="button" class="cam" disabled>カメラ（5秒タイマー）</button>
+        <label class="btn">写真を選ぶ<input type="file" accept="image/*"></label>
+      </div>
+      <div class="view"><p class="hint">全身が入るように、端末を垂直に立てて正面から撮影</p></div>
+      <table class="metrics"></table>
+    </section>
+    <section class="shot" data-kind="side">
+      <div class="bar">
+        <h2>② 右側面</h2>
+        <button type="button" class="cam" disabled>カメラ（5秒タイマー）</button>
+        <label class="btn">写真を選ぶ<input type="file" accept="image/*"></label>
+      </div>
+      <div class="view"><p class="hint">体の右側をカメラに向けて、全身を真横から撮影</p></div>
+      <table class="metrics"></table>
+    </section>
+  </div>
+
+  <section class="summary" id="summary" hidden>
+    <div class="score mono"><span id="score">–</span><small> / 100</small></div>
+    <div class="pattern">
+      <span class="muted">姿勢パターン</span>
+      <strong id="pattern">–</strong>
+      <span id="patternNote" class="muted"></span>
+    </div>
+  </section>
+
+  <p class="note muted">
+    MediaPipe Pose（heavy）で 33 点のランドマークを検出し、傾き（°）と身長比のズレ（%）を計算しています。
+    判定の基準値は一般的な目安で、医学的な診断ではありません。撮影時は端末を垂直・水平に保ってください（端末が傾くと角度にそのまま誤差が乗ります）。
+  </p>
+</main>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task";
+
+// MediaPipe landmark indices
+const NOSE = 0, EAR = [7, 8], SH = [11, 12], HIP = [23, 24], KNEE = [25, 26], ANK = [27, 28], HEEL = [29, 30];
+const L = 0, R = 1;
+
+const status = document.getElementById("status");
+let landmarker;
+const results = { front: null, side: null };
+
+async function init() {
+  const vision = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "IMAGE", numPoses: 1,
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU")); }
+  status.textContent = "準備完了";
+  document.querySelectorAll(".cam").forEach((b) => { b.disabled = false; });
+}
+
+// ---------- geometry helpers ----------
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const deg = (rad) => rad * 180 / Math.PI;
+// Tilt of the line from the person's right point to left point, in degrees. + = left side lower.
+function tilt(pl, pr) {
+  const dx = Math.abs(pl.x - pr.x) || 1e-6;
+  return deg(Math.atan((pl.y - pr.y) / dx));
+}
+// Interior angle at b (degrees) for points a-b-c.
+function angle(a, b, c) {
+  const v1 = { x: a.x - b.x, y: a.y - b.y }, v2 = { x: c.x - b.x, y: c.y - b.y };
+  const cos = (v1.x * v2.x + v1.y * v2.y) / (Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y));
+  return deg(Math.acos(Math.max(-1, Math.min(1, cos))));
+}
+function grade(v, warn, bad) {
+  const a = Math.abs(v);
+  return a >= bad ? "bad" : a >= warn ? "warn" : "good";
+}
+const LABEL = { good: "良好", warn: "注意", bad: "要改善" };
+const f1 = (v) => Math.abs(v).toFixed(1);
+
+// ---------- analysis ----------
+// All points in pixels. H = body height proxy: nose to heels (plus ~8% for the crown of the head).
+function bodyHeight(p) {
+  const heel = Math.max(p[HEEL[L]].y, p[HEEL[R]].y);
+  return (heel - p[NOSE].y) * 1.08;
+}
+
+function analyzeFront(p) {
+  const H = bodyHeight(p);
+  const out = [];
+  const tiltRow = (name, idx) => {
+    const t = tilt(p[idx[L]], p[idx[R]]);
+    const side = t > 0 ? "左が下がり" : "右が下がり";
+    out.push({ name, text: `${side} ${f1(t)}°`, g: grade(t, 1.5, 3), v: t, key: name });
+  };
+  tiltRow("頭の傾き", EAR);
+  tiltRow("肩の傾き", SH);
+  tiltRow("骨盤の傾き", HIP);
+  tiltRow("膝の高さ", KNEE);
+
+  // Lateral shift from the center between the ankles, as % of height.
+  // In a front photo the person's left is on the image right.
+  const base = mid(p[ANK[L]], p[ANK[R]]);
+  const shift = (name, pt) => {
+    const s = (pt.x - base.x) / H * 100;
+    out.push({ name, text: `${s > 0 ? "左" : "右"}へ ${f1(s)}%`, g: grade(s, 1, 2), v: s });
+  };
+  shift("頭の左右ズレ", mid(p[EAR[L]], p[EAR[R]]));
+  shift("肩の左右ズレ", mid(p[SH[L]], p[SH[R]]));
+  shift("骨盤の左右ズレ", mid(p[HIP[L]], p[HIP[R]]));
+
+  // Knee alignment: how far each knee sits off the hip–ankle line, as an angle.
+  // Toward the midline = X-leg (valgus), away = O-leg (varus).
+  const midX = mid(p[HIP[L]], p[HIP[R]]).x;
+  let legSum = 0;
+  for (const [s, name] of [[L, "左膝"], [R, "右膝"]]) {
+    const h = p[HIP[s]], k = p[KNEE[s]], a = p[ANK[s]];
+    const lineX = h.x + (a.x - h.x) * (k.y - h.y) / (a.y - h.y);
+    const d = k.x - lineX;  // knee offset from the hip–ankle line
+    const towardMid = Math.sign(d) === Math.sign(midX - lineX) ? 1 : -1;
+    const dev = (180 - angle(h, k, a)) * towardMid;  // + = X, - = O
+    legSum += dev;
+    out.push({ name: `${name}の向き`, text: dev >= 0 ? `内側（X脚方向）${f1(dev)}°` : `外側（O脚方向）${f1(dev)}°`,
+               g: grade(dev, 4, 8), v: dev });
+  }
+  const legType = Math.abs(legSum / 2) < 4 ? "まっすぐ" : legSum > 0 ? "X脚傾向" : "O脚傾向";
+  return { rows: out, legType, base, H };
+}
+
+function analyzeSide(p) {
+  const H = bodyHeight(p);
+  // Use the side nearer the camera (higher visibility).
+  const vis = (s) => [EAR, SH, HIP, KNEE, ANK].reduce((t, idx) => t + (p[idx[s]].visibility ?? 1), 0);
+  const s = vis(R) >= vis(L) ? R : L;
+  const ear = p[EAR[s]], sh = p[SH[s]], hip = p[HIP[s]], knee = p[KNEE[s]], ank = p[ANK[s]];
+  // Facing direction: +1 if the person faces image right.
+  const f = Math.sign(p[NOSE].x - ear.x) || 1;
+  const fwd = (a, b) => (a.x - b.x) * f / H * 100;  // + = a is in front of b, % of height
+
+  const rows = [];
+  const headAng = deg(Math.atan2((ear.x - sh.x) * f, sh.y - ear.y));  // ear–shoulder line vs vertical
+  rows.push({ name: "頭の前方偏位", text: `${headAng >= 0 ? "前" : "後ろ"}へ ${f1(headAng)}°`,
+              g: grade(Math.max(headAng, 0), 12, 20), v: headAng });
+  const shv = fwd(sh, hip);
+  rows.push({ name: "肩の位置（骨盤比）", text: `${shv >= 0 ? "前" : "後ろ"}へ ${f1(shv)}%`, g: grade(shv, 2, 4), v: shv });
+  const hipv = fwd(hip, ank);
+  rows.push({ name: "骨盤の位置（くるぶし比）", text: `${hipv >= 0 ? "前" : "後ろ"}へ ${f1(hipv)}%`, g: grade(hipv, 2.5, 5), v: hipv });
+  // Knee: + = bent forward, - = hyperextended (knee behind the hip–ankle line).
+  const lineX = hip.x + (ank.x - hip.x) * (knee.y - hip.y) / (ank.y - hip.y);
+  const kneeDev = (180 - angle(hip, knee, ank)) * (Math.sign((knee.x - lineX) * f) || 1);
+  rows.push({ name: "膝", text: kneeDev >= 0 ? `曲がり ${f1(kneeDev)}°` : `反り（反張膝方向）${f1(kneeDev)}°`,
+              g: grade(kneeDev, 5, 10), v: kneeDev });
+  return { rows, pts: { ear, sh, hip, knee, ank }, f, H, headAng, shv, hipv, kneeDev };
+}
+
+function pattern(front, side) {
+  if (!side) return { name: "側面の写真で判定します", note: "" };
+  const { headAng, shv, hipv, kneeDev } = side;
+  let name = "良い姿勢", note = "耳・肩・骨盤・くるぶしがほぼ一直線に並んでいます。";
+  if (hipv >= 2.5 && shv <= -1) { name = "スウェイバック傾向"; note = "骨盤が前に出て、上半身が後ろに倒れています。"; }
+  else if (shv >= 2 && headAng >= 12) { name = "猫背傾向"; note = "肩と頭が骨盤より前に出ています。"; }
+  else if (headAng >= 12) { name = "頭が前に出た姿勢（ストレートネック傾向）"; note = "耳が肩より前にあります。"; }
+  else if (kneeDev <= -5) { name = "反張膝傾向"; note = "膝が後ろに反って伸びています。"; }
+  if (front && front.legType !== "まっすぐ") note += ` 脚は${front.legType}です。`;
+  return { name, note };
+}
+
+function score() {
+  const rows = [...(results.front?.rows ?? []), ...(results.side?.rows ?? [])];
+  const penalty = rows.reduce((t, r) => t + (r.g === "bad" ? 10 : r.g === "warn" ? 4 : 0), 0);
+  return Math.max(0, 100 - penalty);
+}
+
+// ---------- drawing ----------
+const COL = { good: "#5cc98f", warn: "#f2b84b", bad: "#ef6a5b" };
+const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [27, 29], [29, 31], [27, 31], [24, 26], [26, 28], [28, 30], [30, 32], [28, 32], [7, 8]];
+
+function drawBase(ctx, img, p) {
+  const w = ctx.canvas.width;
+  ctx.drawImage(img, 0, 0);
+  ctx.lineCap = "round";
+  ctx.lineWidth = Math.max(2, w / 300);
+  ctx.strokeStyle = "rgba(255,255,255,.8)";
+  for (const [a, b] of BONES) {
+    ctx.beginPath(); ctx.moveTo(p[a].x, p[a].y); ctx.lineTo(p[b].x, p[b].y); ctx.stroke();
+  }
+  ctx.fillStyle = "#fff";
+  for (const i of [0, 7, 8, 11, 12, 23, 24, 25, 26, 27, 28]) {
+    ctx.beginPath(); ctx.arc(p[i].x, p[i].y, w / 180, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function hline(ctx, a, b, g) {
+  const ext = (b.x - a.x) * 0.35;
+  const k = (b.y - a.y) / (b.x - a.x || 1e-6);
+  ctx.strokeStyle = COL[g];
+  ctx.lineWidth = Math.max(3, ctx.canvas.width / 200);
+  ctx.beginPath(); ctx.moveTo(a.x - ext, a.y - k * ext); ctx.lineTo(b.x + ext, b.y + k * ext); ctx.stroke();
+}
+
+function drawFront(ctx, img, p, res) {
+  drawBase(ctx, img, p);
+  const g = Object.fromEntries(res.rows.map((r) => [r.name, r.g]));
+  // Tilt lines from the person's right (image left) to left.
+  hline(ctx, p[EAR[R]], p[EAR[L]], g["頭の傾き"]);
+  hline(ctx, p[SH[R]], p[SH[L]], g["肩の傾き"]);
+  hline(ctx, p[HIP[R]], p[HIP[L]], g["骨盤の傾き"]);
+  hline(ctx, p[KNEE[R]], p[KNEE[L]], g["膝の高さ"]);
+  // Center plumb line from between the ankles.
+  ctx.setLineDash([12, 10]);
+  ctx.strokeStyle = "#5cc9ff";
+  ctx.lineWidth = Math.max(2, ctx.canvas.width / 300);
+  ctx.beginPath(); ctx.moveTo(res.base.x, 0); ctx.lineTo(res.base.x, ctx.canvas.height); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawSide(ctx, img, p, res) {
+  drawBase(ctx, img, p);
+  const { ear, sh, hip, knee, ank } = res.pts;
+  ctx.setLineDash([12, 10]);
+  ctx.strokeStyle = "#5cc9ff";
+  ctx.lineWidth = Math.max(2, ctx.canvas.width / 300);
+  ctx.beginPath(); ctx.moveTo(ank.x, 0); ctx.lineTo(ank.x, ctx.canvas.height); ctx.stroke();
+  ctx.setLineDash([]);
+  const g = res.rows.map((r) => r.g);
+  ctx.lineWidth = Math.max(3, ctx.canvas.width / 200);
+  const seg = (a, b, gg) => { ctx.strokeStyle = COL[gg]; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); };
+  seg(ear, sh, g[0]); seg(sh, hip, g[1]); seg(hip, knee, g[2]); seg(knee, ank, g[3]);
+  for (const pt of [ear, sh, hip, knee, ank]) {
+    ctx.fillStyle = "#5cc9ff";
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, ctx.canvas.width / 110, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---------- UI ----------
+function renderRows(table, rows) {
+  table.innerHTML = rows.map((r) =>
+    `<tr><td>${r.name}</td><td class="val mono">${r.text}</td><td class="val"><span class="chip ${r.g}">${LABEL[r.g]}</span></td></tr>`
+  ).join("");
+}
+
+function renderSummary() {
+  const any = results.front || results.side;
+  document.getElementById("summary").hidden = !any;
+  if (!any) return;
+  document.getElementById("score").textContent = score();
+  const pt = pattern(results.front, results.side);
+  document.getElementById("pattern").textContent = pt.name;
+  document.getElementById("patternNote").textContent = pt.note;
+}
+
+async function analyzeImage(section, img) {
+  const kind = section.dataset.kind;
+  const view = section.querySelector(".view");
+  const table = section.querySelector(".metrics");
+  const w = img.naturalWidth || img.videoWidth || img.width, h = img.naturalHeight || img.videoHeight || img.height;
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+  status.textContent = "解析中…";
+  const r = landmarker.detect(cv);
+  if (!r.landmarks.length) {
+    view.replaceChildren(cv);
+    table.innerHTML = `<tr><td>人物を検出できませんでした。全身が写った写真で撮り直してください。</td></tr>`;
+    results[kind] = null;
+    renderSummary();
+    status.textContent = "準備完了";
+    return;
+  }
+  const p = r.landmarks[0].map((q) => ({ x: q.x * w, y: q.y * h, visibility: q.visibility }));
+  // Every measurement needs head-to-heel in the frame; refuse half-body shots instead of guessing.
+  const inFrame = [NOSE, ...HEEL].every((i) => p[i].y > 0 && p[i].y < h);
+  if (!inFrame) {
+    view.replaceChildren(cv);
+    table.innerHTML = `<tr><td>頭から足先までが写っていません。全身が入るように撮り直してください。</td></tr>`;
+    results[kind] = null;
+    renderSummary();
+    status.textContent = "準備完了";
+    return;
+  }
+  const snapshot = document.createElement("canvas");
+  snapshot.width = w; snapshot.height = h;
+  snapshot.getContext("2d").drawImage(cv, 0, 0);
+  if (kind === "front") {
+    results.front = analyzeFront(p);
+    drawFront(ctx, snapshot, p, results.front);
+    renderRows(table, [...results.front.rows, { name: "脚の形", text: results.front.legType,
+      g: results.front.legType === "まっすぐ" ? "good" : "warn" }]);
+  } else {
+    results.side = analyzeSide(p);
+    drawSide(ctx, snapshot, p, results.side);
+    renderRows(table, results.side.rows);
+  }
+  view.replaceChildren(cv);
+  renderSummary();
+  status.textContent = "準備完了";
+}
+
+function loadFile(section, file) {
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => analyzeImage(section, img).catch((e) => { status.textContent = `解析エラー: ${e.message}`; });
+  img.src = URL.createObjectURL(file);
+}
+
+// In-page camera with a 5 s self-timer, so one person can shoot alone.
+let stream = null;
+async function shootWithTimer(section) {
+  const view = section.querySelector(".view");
+  try {
+    stream?.getTracks().forEach((t) => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false,
+    });
+  } catch (e) {
+    status.textContent = e.name === "NotAllowedError" ? "カメラが許可されていません" : `カメラエラー: ${e.message}`;
+    return;
+  }
+  const video = document.createElement("video");
+  video.playsInline = true; video.muted = true; video.srcObject = stream;
+  video.classList.add("mirror");
+  const count = document.createElement("div");
+  count.className = "count";
+  view.replaceChildren(video, count);
+  await video.play();
+  for (let n = 5; n > 0; n--) { count.textContent = n; await new Promise((r) => setTimeout(r, 1000)); }
+  count.remove();
+  // Grab the frame before stopping the camera, otherwise the video goes blank.
+  const still = document.createElement("canvas");
+  still.width = video.videoWidth; still.height = video.videoHeight;
+  still.getContext("2d").drawImage(video, 0, 0);
+  stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  await analyzeImage(section, still);
+}
+
+document.querySelectorAll(".shot").forEach((section) => {
+  section.querySelector("input[type=file]").onchange = (e) => loadFile(section, e.target.files[0]);
+  section.querySelector(".cam").onclick = () => shootWithTimer(section);
+});
+
+init().catch((e) => { status.textContent = `モデル読込失敗: ${e.message}`; });
+</script>
+</body>
+</html>
